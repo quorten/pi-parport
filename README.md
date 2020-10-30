@@ -77,6 +77,48 @@ make[1]: Entering directory '/usr/src/linux-headers-4.19.75-v7+'
 make[1]: Leaving directory '/usr/src/linux-headers-4.19.75-v7+'
 ```
 
+### Notes on extended, nonstandard driver capabilities
+
+The SN74LVC161284DL transceiver chip on v2+ boards has the capability
+to drive 5 control pins and sense 4 status pins.  This allows the chip
+to be used as a "device-side" driver rather than a "host-side"
+transceiver.  There are two additional pins, `HOST_LOGIC_IN` and
+`PERI_LOGIC_OUT`, that can be used as an additional status and control
+pin under limited circumstances.  They primarily exist to support
+power management when using 36-pin parallel port connectors.  However,
+they can be used as an additional status and control pin under limited
+circumstances.
+
+* `HOST_LOGIC_IN` is mapped to `STATUS3` in v2+ boards.
+* `Y13` and `PERI_LOGIC_OUT` are mapped to `CONTROL4` and `CONTROL5`
+   in v5+ boards.
+
+The default drive mode of the parallel port output pins is
+"totem-pole" mode, which means that a high current source is provided
+for both logic level 1 and 0.  If you wish logic level 1 to be a low
+current source provided by pull-up resistors, i.e. "open-drain" mode,
+you either need to change the driver initialization code or enable
+software control over the drive mode by uncommenting the
+`-DCONFIG_PARPORT_GPIO_HD_CTL` line in the Makefile.  This allows you
+to use ppdev ioctls to control this setting as an additional
+`CONTROL7` bit.  Use `CONTROL7=1` for totem-pole mode, `CONTROL7=0`
+for open-drain mode.
+
+Note that `HOST_LOGIC_IN` does not have a pull-up resistor inside the
+transceiver chip.  Instead, there is a hard-wired 1.4K pull-up
+resistor on the board to support host communications mode.  Likewise,
+`PERI_LOGIC_OUT` does not have a pull-up resistor, but there are pads
+on the board to solder one in place if you so wish.
+
+In particular, totem-pole mode is required if you wish to drive LEDs
+or some other power consuming device, open-drain mode is required if
+you will be using a daisy chain bus topology or there is uncertainty
+in the direction of a bidirectional bus at times.
+
+Also note, to use the nonstandard operating modes, you must, of
+course, create a rewiring dongle to get your desired pinout, and add
+more resistors if needed.
+
 ### Installing the Device Tree Overlay
 
 The device tree overlay maps specific GPIO pins to their functions in
@@ -120,7 +162,7 @@ You'll see the port announce itself on the console:
 [4425200.988400] parport-gpio ppgpio@0: data on pins [22,23,24,10,25,9,8,11]
 [4425200.988412] parport-gpio ppgpio@0: status on pins [18,17,4,3,2]
 [4425200.988422] parport-gpio ppgpio@0: control on pins [26,19,6,13]
-[4425200.988430] parport-gpio ppgpio@0: hd on pin 20
+[4425200.988430] parport-gpio ppgpio@0: hd=1 on pin 20
 [4425200.988438] parport-gpio ppgpio@0: dir on pin 21
 ```
 If you wish to set up a parallel printer:

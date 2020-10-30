@@ -96,6 +96,14 @@ static unsigned char parport_gpio_read_control(struct parport *p)
 	control |= gpiod_get_value(ctx->control->desc[1]) << 1;
 	control |= gpiod_get_value(ctx->control->desc[2]) << 2;
 	control |= gpiod_get_value(ctx->control->desc[3]) << 3;
+	if (ctx->control->ndescs >= 5)
+		control |= gpiod_get_value(ctx->control->desc[4]) << 4;
+	if (ctx->control->ndescs >= 6)
+		control |= gpiod_get_value(ctx->control->desc[5]) << 5;
+#ifdef CONFIG_PARPORT_GPIO_HD_CTL
+	if (ctx->hd)
+		control |= gpiod_get_value(ctx->hd) << 7;
+#endif
 
 	spin_unlock_irqrestore(&ctx->lock, flags);
 
@@ -107,7 +115,7 @@ static void parport_gpio_write_control(struct parport *p, unsigned char control)
 	struct parport_gpio_ctx *ctx = p->private_data;
 	unsigned long flags;
 #if KERNEL_VERSION(5, 4, 0) > LINUX_VERSION_CODE
-	int value[4];
+	int value[6];
 #else
 	long value = 0L;
 #endif
@@ -119,11 +127,17 @@ static void parport_gpio_write_control(struct parport *p, unsigned char control)
 	value[1] = (control >> 1) & 1; // ~nAutoLF
 	value[2] = (control >> 2) & 1; // nInitialize
 	value[3] = (control >> 3) & 1; // ~nSelect
+	value[4] = (control >> 4) & 1; // CONTROL4, device-side of STATUS7
+	value[5] = (control >> 5) & 1; // CONTROL5 == PERI_LOGIC_OUT
 	gpiod_set_array_value(ctx->control->ndescs, ctx->control->desc, value);
 #else
 	value |= control;
 	gpiod_set_array_value(ctx->control->ndescs, ctx->control->desc,
 			      ctx->control->info, &value);
+#endif
+#ifdef CONFIG_PARPORT_GPIO_HD_CTL
+	if (ctx->hd)
+		gpiod_set_value(ctx->hd, (control >> 7) & 1);
 #endif
 
 	spin_unlock_irqrestore(&ctx->lock, flags);
@@ -150,6 +164,19 @@ static unsigned char parport_gpio_frob_control(struct parport *p,
 	if ((mask & 8)) { // ~nSelect
 		gpiod_set_value(ctx->control->desc[3], (val >> 3) & 1);
 	}
+	if ((mask & 16) && ctx->control->ndescs >= 5) {
+		// CONTROL4, device-side of STATUS7
+		gpiod_set_value(ctx->control->desc[4], (val >> 4) & 1);
+	}
+	if ((mask & 32) && ctx->control->ndescs >= 6) {
+		// CONTROL4, device-side of STATUS7
+		gpiod_set_value(ctx->control->desc[5], (val >> 5) & 1);
+	}
+#ifdef CONFIG_PARPORT_GPIO_HD_CTL
+	if ((mask & 128) && ctx->hd) { // High Drive pin
+		gpiod_set_value(ctx->hd, (val >> 7) & 1);
+	}
+#endif
 
 	spin_unlock_irqrestore(&ctx->lock, flags);
 
@@ -227,6 +254,31 @@ static void parport_gpio_data_reverse(struct parport *p)
 	}
 }
 
+#ifdef CONFIG_PARPORT_GPIO_HD_CTL
+/* These parallel port functions cannot be used by the traditional Linux
+ * driver stack because they require new function pointers and ioctls,
+ * but they could be added to an extended parallel port implementation.
+ */
+
+// Set the output pin drive mode to totem-pole.
+static void parport_gpio_drive_totem(struct parport *p)
+{
+	struct parport_gpio_ctx *ctx = p->private_data;
+
+	if (ctx->hd)
+		gpiod_set_value(ctx->hd, 1);
+}
+
+// Set the output pin drive mode to open-drain.
+static void parport_gpio_drive_odrain(struct parport *p)
+{
+	struct parport_gpio_ctx *ctx = p->private_data;
+
+	if (ctx->hd)
+		gpiod_set_value(ctx->hd, 0);
+}
+#endif
+
 static struct parport_operations parport_gpio_ops = {
 	.write_data = parport_gpio_write_data,
 	.read_data = parport_gpio_read_data,
@@ -287,9 +339,21 @@ static void parport_gpio_print_info(struct parport *p)
 		desc_to_gpio(ctx->control->desc[2]),
 		desc_to_gpio(ctx->control->desc[1]),
 		desc_to_gpio(ctx->control->desc[0]));
+	if (ctx->control->ndescs >= 5)
+		dev_info(p->dev, "xcontrol on pin [%d]\n",
+			desc_to_gpio(ctx->control->desc[4]));
+	if (ctx->control->ndescs >= 6)
+		dev_info(p->dev, "xcontrol on pin [%d]\n",
+			desc_to_gpio(ctx->control->desc[5]));
+#ifdef CONFIG_PARPORT_GPIO_HD_CTL
 	if (ctx->hd)
-		dev_info(p->dev, "hd on pin %d\n",
-			desc_to_gpio(ctx->hd));
+		dev_info(p->dev, "hd=%d on pin %d, ppdev accessible\n",
+			gpiod_get_value(ctx->hd), desc_to_gpio(ctx->hd));
+#else
+	if (ctx->hd)
+		dev_info(p->dev, "hd=%d on pin %d\n",
+			gpiod_get_value(ctx->hd), desc_to_gpio(ctx->hd));
+#endif
 	if (ctx->dir)
 		dev_info(p->dev, "dir on pin %d\n",
 			desc_to_gpio(ctx->dir));
@@ -331,8 +395,9 @@ static int parport_gpio_attach(struct device *dev,
 		dev_err(dev, "could not get status pins\n");
 		goto out;
 	}
+	// v5+ hardware has 6 control pins instead of 4
 	ctx->control = gpiod_get_array_optional(dev, "control", GPIOD_OUT_LOW);
-	if (!ctx->control || ctx->control->ndescs != 4) {
+	if (!ctx->control || ctx->control->ndescs < 4) {
 		dev_err(dev, "could not get control pins\n");
 		goto out;
 	}
@@ -348,10 +413,17 @@ static int parport_gpio_attach(struct device *dev,
 		if (gpiod_cansleep(ctx->control->desc[i]))
 			goto out_cansleep;
 	}
-	/* v2 hardware design has SN74LVBC161284 HD and DIR pins.
+	/* v2 hardware design has SN74LVC161284DL HD and DIR pins.
 	 * If device tree overlay defines these, initialize:
 	 * DIR: 1=data flows in the A-B direction (not B-A)
-	 * HD: 1=outputs in totem pole config (not open drain)
+	 * HD: 1=outputs in totem-pole config (not open-drain)
+	 *     Daisy chain configurations and setups with
+	 *     uncertainty in the bidirectional data bus should
+	 *     use HD=0.  LED driving and other power-consuming uses
+	 *     should use HD=1.
+	 * NOTE: Since all outputs are initialized low, it is fine for
+	 * us to default to totem-pole configuration and leave it up
+	 * to the user to reconfigure if needed.
 	 */
 	ctx->hd = gpiod_get_optional(dev, "hd", GPIOD_OUT_HIGH);
 	if (ctx->hd && gpiod_cansleep(ctx->hd))

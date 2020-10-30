@@ -3,6 +3,7 @@ KERNEL_PATH ?= /lib/modules/$(KERNEL_VERSION)/build
 MODDIR=/lib/modules/`uname -r`
 
 ccflags-y = -DCONFIG_PARPORT_NOT_PC -DCONFIG_PARPORT_1284
+# ccflags-y += -DCONFIG_PARPORT_GPIO_HD_CTL
 
 ifndef KERNEL_HAS_PARPORT
 obj-m += parport/
